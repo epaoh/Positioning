@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>経路トラッカー (累積距離・停止機能付)</title>
+    <title>最大到達距離トラッカー</title>
     <link rel="manifest" href="manifest.json">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <style>
@@ -18,12 +18,15 @@
         #startBtn:disabled, #stopBtn:disabled { background-color: #ccc; cursor: not-allowed; }
         .result { font-weight: bold; color: #007bff; margin-top: 20px; padding: 15px; background: #e7f1ff; border-radius: 8px; }
         .status-badge { font-size: 0.8rem; padding: 2px 8px; border-radius: 10px; background: #eee; margin-left: 10px; }
+        .hint { font-size: 0.8rem; color: #888; margin-top: 5px; }
     </style>
 </head>
 <body>
 
 <div class="container">
-    <h2>経路トラッカー <span id="statusBadge" class="status-badge">停止中</span></h2>
+    <h2>最大到達距離トラッカー <span id="statusBadge" class="status-badge">停止中</span></h2>
+    <p class="hint">※距離を累積(逆戻りはカウントしない)</p>
+    
     <button id="startBtn">計測開始</button>
     <button id="stopBtn" disabled>計測終了</button>
 
@@ -31,20 +34,20 @@
         <div id="startTimeInfo" class="info-block"><strong>開始点：</strong> -</div>
         <div id="currentTimeInfo" class="info-block"><strong>現在地：</strong> -</div>
         <div id="resultInfo" class="result">
-            走行距離: <span id="distVal">0.000</span> km<br>
+            最大到達距離: <span id="distVal">0.000</span> km<br>
             経過時間: <span id="timeVal">0分 0秒</span>
         </div>
     </div>
-    <button id="resetBtn" style="background:none; color:gray; font-size:12px; border:1px solid #ccc; padding:5px; margin-top: 15px;">全データをリセット</button>
+    <button id="resetBtn" style="background:none; color:gray; font-size:11px; border:1px solid #ccc; padding:4px; margin-top:15px;">全データをリセット</button>
 </div>
 
 <script>
     let watchId = null;
-    let timerId = null; // タイマー停止用
+    let timerId = null;
     let wakeLock = null;
     let startTime = null;
-    let lastPos = null;
-    let totalDistance = 0;
+    let startPos = null; // 開始地点を固定保持
+    let maxDistance = 0; // 最大到達距離
 
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
@@ -53,6 +56,7 @@
     const timeVal = document.getElementById('timeVal');
     const statusBadge = document.getElementById('statusBadge');
 
+    // ハバーシン公式
     function calculateDistance(lat1, lon1, lat2, lon2) {
         const R = 6371;
         const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -72,64 +76,53 @@
     }
 
     async function requestWakeLock() {
-        try {
-            if ('wakeLock' in navigator) {
-                wakeLock = await navigator.wakeLock.request('screen');
-            }
-        } catch (err) { console.error(`${err.name}, ${err.message}`); }
+        try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (err) {}
     }
 
-    // 経過時間を更新する関数
     function updateTimerDisplay() {
         if (!startTime) return;
         const diff = new Date() - startTime;
-        const min = Math.floor(diff / 60000);
-        const sec = Math.floor((diff % 60000) / 1000);
-        timeVal.innerText = `${min}分 ${sec}秒`;
+        timeVal.innerText = `${Math.floor(diff / 60000)}分 ${Math.floor((diff % 60000) / 1000)}秒`;
     }
 
-    function startTimeCounter() {
-        if (timerId) clearInterval(timerId); // 既存のタイマーをクリア
-        timerId = setInterval(updateTimerDisplay, 1000);
-    }
-
+    // 監視メインロジック
     function startWatching() {
         watchId = navigator.geolocation.watchPosition((pos) => {
             const current = { lat: pos.coords.latitude, lon: pos.coords.longitude };
             
-            if (lastPos) {
-                const d = calculateDistance(lastPos.lat, lastPos.lon, current.lat, current.lon);
-                if (d > 0.005) { // 5m以上の移動で加算
-                    totalDistance += d;
-                    distVal.innerText = totalDistance.toFixed(3);
-                }
-            }
-            lastPos = current;
+            // 開始地点からの「現在の直線距離」を算出
+            const currentDist = calculateDistance(startPos.lat, startPos.lon, current.lat, current.lon);
             
-            // 定期的な保存（リロード対策）
-            const saved = localStorage.getItem("tracking_v2");
+            // これまでの最大値を更新した場合のみ反映
+            if (currentDist > maxDistance) {
+                maxDistance = currentDist;
+                distVal.innerText = maxDistance.toFixed(3);
+            }
+            
+            // ローカルストレージに最新の最大値を保存（リロード対策）
+            const saved = JSON.parse(localStorage.getItem("tracking_max_v1"));
             if (saved) {
-                const data = JSON.parse(saved);
-                data.totalDistance = totalDistance;
-                data.lastPos = lastPos;
-                localStorage.setItem("tracking_v2", JSON.stringify(data));
+                saved.maxDistance = maxDistance;
+                localStorage.setItem("tracking_max_v1", JSON.stringify(saved));
             }
 
-            document.getElementById('currentTimeInfo').innerHTML = `<strong>現在地：</strong> (緯度: ${current.lat.toFixed(5)}, 経度: ${current.lon.toFixed(5)})`;
-        }, (err) => console.error(err), { enableHighAccuracy: true });
+            document.getElementById('currentTimeInfo').innerHTML = 
+                `<strong>現在地：</strong> (緯度: ${current.lat.toFixed(5)}, 経度: ${current.lon.toFixed(5)})`;
+        }, null, { enableHighAccuracy: true });
     }
 
     function restoreState() {
-        const saved = localStorage.getItem("tracking_v2");
+        const saved = localStorage.getItem("tracking_max_v1");
         if (saved) {
             const data = JSON.parse(saved);
             startTime = new Date(data.startTime);
-            totalDistance = data.totalDistance;
-            lastPos = data.lastPos;
+            startPos = data.startPos;
+            maxDistance = data.maxDistance || 0;
             
-            distVal.innerText = totalDistance.toFixed(3);
-            updateTimerDisplay(); // 初回表示
-            document.getElementById('startTimeInfo').innerHTML = `<strong>開始点：</strong> ${startTime.toLocaleTimeString()}<br><div class="address">${data.startAddress}</div>`;
+            distVal.innerText = maxDistance.toFixed(3);
+            updateTimerDisplay();
+            document.getElementById('startTimeInfo').innerHTML = 
+                `<strong>開始点：</strong> ${startTime.toLocaleTimeString()}<br><div class="address">${data.startAddress}</div>`;
             
             startBtn.disabled = true;
             stopBtn.disabled = false;
@@ -138,7 +131,7 @@
             statusBadge.style.color = "white";
             
             startWatching();
-            startTimeCounter();
+            timerId = setInterval(updateTimerDisplay, 1000);
         }
     }
 
@@ -148,22 +141,23 @@
         
         navigator.geolocation.getCurrentPosition(async (pos) => {
             startTime = new Date();
-            lastPos = { lat: pos.coords.latitude, lon: pos.coords.longitude };
-            totalDistance = 0;
-            const address = await getAddress(lastPos.lat, lastPos.lon);
+            startPos = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+            maxDistance = 0;
+            const address = await getAddress(startPos.lat, startPos.lon);
 
-            localStorage.setItem("tracking_v2", JSON.stringify({
+            localStorage.setItem("tracking_max_v1", JSON.stringify({
                 startTime: startTime.toISOString(),
-                totalDistance: 0,
-                lastPos: lastPos,
+                startPos: startPos,
+                maxDistance: 0,
                 startAddress: address
             }));
 
-            document.getElementById('startTimeInfo').innerHTML = `<strong>開始点：</strong> ${startTime.toLocaleTimeString()}<br><div class="address">${address}</div>`;
+            document.getElementById('startTimeInfo').innerHTML = 
+                `<strong>開始点：</strong> ${startTime.toLocaleTimeString()}<br><div class="address">${address}</div>`;
             
             await requestWakeLock();
             startWatching();
-            startTimeCounter();
+            timerId = setInterval(updateTimerDisplay, 1000);
             
             stopBtn.disabled = false;
             statusBadge.innerText = "計測中";
@@ -173,18 +167,13 @@
     };
 
     stopBtn.onclick = () => {
-        // 全ての監視とタイマーを停止
         if (watchId) navigator.geolocation.clearWatch(watchId);
-        if (timerId) clearInterval(timerId); // タイマー停止
-        if (wakeLock) {
-            wakeLock.release();
-            wakeLock = null;
-        }
+        if (timerId) clearInterval(timerId);
+        if (wakeLock) { wakeLock.release(); wakeLock = null; }
         
-        // 最終表示を確定
         updateTimerDisplay();
+        localStorage.removeItem("tracking_max_v1");
         
-        localStorage.removeItem("tracking_v2");
         statusBadge.innerText = "終了";
         statusBadge.style.background = "#007bff";
         startBtn.disabled = false;
@@ -192,8 +181,8 @@
     };
 
     resetBtn.onclick = () => {
-        if(confirm("全てのデータをリセットしますか？")) {
-            localStorage.removeItem("tracking_v2");
+        if(confirm("データをリセットしますか？")) {
+            localStorage.removeItem("tracking_max_v1");
             location.reload();
         }
     };
