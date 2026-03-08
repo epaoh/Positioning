@@ -3,57 +3,59 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>位置・住所トラッカー (確定保存版)</title>
-<link rel="manifest" href="manifest.json">
-<meta name="apple-mobile-web-app-capable" content="yes">
+    <title>位置・経路トラッカー (累積距離版)</title>
+    <link rel="manifest" href="manifest.json">
+    <meta name="apple-mobile-web-app-capable" content="yes">
     <style>
         body { font-family: sans-serif; padding: 20px; line-height: 1.6; background-color: #f4f7f6; }
         .container { max-width: 600px; margin: auto; padding: 30px; border-radius: 12px; background: white; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
         .display-area { margin-top: 25px; padding: 15px; background: #fefefe; border-left: 4px solid #007bff; border-radius: 4px; }
-        .info-block { margin-bottom: 15px; font-size: 0.95rem; min-height: 1.5em; }
-        .address { font-size: 0.85rem; color: #666; font-style: italic; margin-top: 4px; }
-        button { padding: 12px 24px; font-size: 16px; cursor: pointer; border: none; border-radius: 6px; }
+        .info-block { margin-bottom: 10px; font-size: 0.95rem; }
+        .address { font-size: 0.85rem; color: #666; font-style: italic; }
+        button { padding: 12px 24px; font-size: 16px; cursor: pointer; border: none; border-radius: 6px; margin-bottom: 10px; }
         #startBtn { background-color: #28a745; color: white; }
-        #startBtn:disabled { background-color: #ccc; cursor: not-allowed; }
         #stopBtn { background-color: #dc3545; color: white; }
-        #stopBtn:disabled { background-color: #ccc; cursor: not-allowed; }
-        #resetBtn { background-color: #6c757d; color: white; margin-top: 15px; font-size: 12px; padding: 5px 10px; }
-        .result { font-weight: bold; color: #007bff; margin-top: 20px; padding-top: 15px; border-top: 2px solid #eee; font-size: 1.1rem; }
+        #startBtn:disabled, #stopBtn:disabled { background-color: #ccc; cursor: not-allowed; }
+        .result { font-weight: bold; color: #007bff; margin-top: 20px; padding: 15px; background: #e7f1ff; border-radius: 8px; }
+        .status-badge { font-size: 0.8rem; padding: 2px 8px; border-radius: 10px; background: #eee; margin-left: 10px; }
     </style>
 </head>
 <body>
 
 <div class="container">
-    <h2>位置・住所トラッカー</h2>
-    <p>移動距離を積算します</p>
-    <button id="startBtn">開始</button>
-    <button id="stopBtn" disabled>終了</button>
-    <br>
-    <button id="resetBtn">データをリセット</button>
+    <h2>経路トラッカー <span id="statusBadge" class="status-badge">停止中</span></h2>
+    <p>移動距離を積算するバージョン</p>
+    <button id="startBtn">計測開始</button>
+    <button id="stopBtn" disabled>計測終了</button>
 
     <div class="display-area">
-        <div id="startTimeInfo" class="info-block"><strong>開始点：</strong> 未取得</div>
-        <div id="stopTimeInfo" class="info-block"><strong>終了点：</strong> 未取得</div>
-        <div id="resultInfo" class="result"></div>
+        <div id="startTimeInfo" class="info-block"><strong>開始点：</strong> -</div>
+        <div id="currentTimeInfo" class="info-block"><strong>現在地：</strong> -</div>
+        <div id="resultInfo" class="result">
+            走行距離: <span id="distVal">0.000</span> km<br>
+            経過時間: <span id="timeVal">0分 0秒</span>
+        </div>
     </div>
+    <button id="resetBtn" style="background:none; color:gray; font-size:12px; border:1px solid #ccc; padding:5px;">全データをリセット</button>
 </div>
 
 <script>
-    // グローバル変数の宣言
-    let startPos = null;
+    let watchId = null;
+    let wakeLock = null;
     let startTime = null;
+    let lastPos = null;
+    let totalDistance = 0;
 
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
     const resetBtn = document.getElementById('resetBtn');
-    const startTimeInfo = document.getElementById('startTimeInfo');
-    const stopTimeInfo = document.getElementById('stopTimeInfo');
-    const resultInfo = document.getElementById('resultInfo');
+    const distVal = document.getElementById('distVal');
+    const timeVal = document.getElementById('timeVal');
+    const statusBadge = document.getElementById('statusBadge');
 
-    const R = 6371; // 地球の半径(km)
-
-    // 距離計算関数
+    // 距離計算（ハバーシン公式）
     function calculateDistance(lat1, lon1, lat2, lon2) {
+        const R = 6371;
         const dLat = (lat2 - lat1) * Math.PI / 180;
         const dLon = (lon2 - lon1) * Math.PI / 180;
         const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
@@ -62,118 +64,130 @@
         return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
     }
 
-    // 住所取得関数
+    // 住所取得
     async function getAddress(lat, lon) {
         try {
-            const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`, {
-                headers: { 'Accept-Language': 'ja' }
-            });
-            const data = await response.json();
-            return data.display_name || "住所不明";
+            const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`, { headers: {'Accept-Language': 'ja'} });
+            const data = await res.json();
+            return data.display_name;
         } catch (e) { return "住所取得エラー"; }
     }
 
-    // 位置情報取得関数
-    function getPosition() {
-        return new Promise((resolve, reject) => {
-            navigator.geolocation.getCurrentPosition(resolve, reject, { 
-                enableHighAccuracy: true, 
-                timeout: 10000 
-            });
-        });
+    // 画面スリープ防止 (Wake Lock)
+    async function requestWakeLock() {
+        try {
+            if ('wakeLock' in navigator) {
+                wakeLock = await navigator.wakeLock.request('screen');
+            }
+        } catch (err) { console.error(`${err.name}, ${err.message}`); }
     }
 
-    // --- 状態の復元処理 (ここが重要) ---
+    // 状態の復元
     function restoreState() {
-        const saved = localStorage.getItem("tracking_data");
+        const saved = localStorage.getItem("tracking_v2");
         if (saved) {
             const data = JSON.parse(saved);
-            startPos = data.pos;
-            startTime = new Date(data.time);
+            startTime = new Date(data.startTime);
+            totalDistance = data.totalDistance;
+            lastPos = data.lastPos;
             
-            startTimeInfo.innerHTML = `
-                <strong>開始点：</strong> ${startTime.toLocaleTimeString()}<br>
-                <div class="address">場所: ${data.address}</div>
-            `;
+            distVal.innerText = totalDistance.toFixed(3);
+            document.getElementById('startTimeInfo').innerHTML = `<strong>開始点：</strong> ${startTime.toLocaleTimeString()}<br><div class="address">${data.startAddress}</div>`;
+            
             startBtn.disabled = true;
             stopBtn.disabled = false;
+            statusBadge.innerText = "計測中";
+            statusBadge.style.background = "#28a745";
+            statusBadge.style.color = "white";
+            
+            startWatching();
+            startTimeCounter();
         }
     }
 
-    // ページ読み込み時に即実行
-    restoreState();
+    function startTimeCounter() {
+        setInterval(() => {
+            if (!startTime) return;
+            const diff = new Date() - startTime;
+            timeVal.innerText = `${Math.floor(diff/60000)}分 ${Math.floor((diff%60000)/1000)}秒`;
+        }, 1000);
+    }
 
-    // --- ボタンイベント ---
+    function startWatching() {
+        watchId = navigator.geolocation.watchPosition(async (pos) => {
+            const current = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+            
+            if (lastPos) {
+                const d = calculateDistance(lastPos.lat, lastPos.lon, current.lat, current.lon);
+                // 誤差対策: 5m以上移動した場合のみ加算
+                if (d > 0.005) {
+                    totalDistance += d;
+                    distVal.innerText = totalDistance.toFixed(3);
+                }
+            }
+            
+            lastPos = current;
+            
+            // データの定期保存
+            const currentData = JSON.parse(localStorage.getItem("tracking_v2"));
+            if (currentData) {
+                currentData.totalDistance = totalDistance;
+                currentData.lastPos = lastPos;
+                localStorage.setItem("tracking_v2", JSON.stringify(currentData));
+            }
+
+            document.getElementById('currentTimeInfo').innerHTML = `<strong>現在地：</strong> (緯度: ${current.lat.toFixed(5)}, 経度: ${current.lon.toFixed(5)})`;
+        }, (err) => console.error(err), { enableHighAccuracy: true });
+    }
 
     startBtn.onclick = async () => {
         startBtn.disabled = true;
-        startTimeInfo.innerHTML = "<strong>開始点：</strong> 取得中...";
+        statusBadge.innerText = "取得中...";
         
-        try {
-            const position = await getPosition();
-            startPos = { latitude: position.coords.latitude, longitude: position.coords.longitude };
+        navigator.geolocation.getCurrentPosition(async (pos) => {
             startTime = new Date();
-            const address = await getAddress(startPos.latitude, startPos.longitude);
+            lastPos = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+            totalDistance = 0;
+            const address = await getAddress(lastPos.lat, lastPos.lon);
 
-            // localStorageに保存
-            const trackingData = {
-                pos: startPos,
-                time: startTime.toISOString(),
-                address: address
-            };
-            localStorage.setItem("tracking_data", JSON.stringify(trackingData));
+            localStorage.setItem("tracking_v2", JSON.stringify({
+                startTime: startTime.toISOString(),
+                totalDistance: 0,
+                lastPos: lastPos,
+                startAddress: address
+            }));
 
-            startTimeInfo.innerHTML = `
-                <strong>開始点：</strong> ${startTime.toLocaleTimeString()}<br>
-                <div class="address">場所: ${address}</div>
-            `;
+            document.getElementById('startTimeInfo').innerHTML = `<strong>開始点：</strong> ${startTime.toLocaleTimeString()}<br><div class="address">${address}</div>`;
+            
+            await requestWakeLock();
+            startWatching();
+            startTimeCounter();
+            
             stopBtn.disabled = false;
-        } catch (e) {
-            alert("位置情報が取得できません。設定を確認してください。");
-            startBtn.disabled = false;
-            startTimeInfo.innerHTML = "<strong>開始点：</strong> 未取得";
-        }
+            statusBadge.innerText = "計測中";
+            statusBadge.style.background = "#28a745";
+            statusBadge.style.color = "white";
+        });
     };
 
-    stopBtn.onclick = async () => {
+    stopBtn.onclick = () => {
+        if (watchId) navigator.geolocation.clearWatch(watchId);
+        if (wakeLock) wakeLock.release();
+        
+        localStorage.removeItem("tracking_v2");
+        statusBadge.innerText = "完了";
+        statusBadge.style.background = "#007bff";
+        startBtn.disabled = false;
         stopBtn.disabled = true;
-        stopTimeInfo.innerHTML = "<strong>終了点：</strong> 取得中...";
-
-        try {
-            const position = await getPosition();
-            const stopPos = position.coords;
-            const stopTime = new Date();
-            const address = await getAddress(stopPos.latitude, stopPos.longitude);
-
-            stopTimeInfo.innerHTML = `
-                <strong>終了点：</strong> ${stopTime.toLocaleTimeString()}<br>
-                <div class="address">場所: ${address}</div>
-            `;
-
-            const diffMs = stopTime - startTime;
-            const distance = calculateDistance(startPos.latitude, startPos.longitude, stopPos.latitude, stopPos.longitude);
-
-            resultInfo.innerHTML = `
-                移動距離: ${distance.toFixed(3)} km <br>
-                経過時間: ${Math.floor(diffMs/60000)}分 ${Math.floor((diffMs%60000)/1000)}秒
-            `;
-
-            // 完了後はデータを消去
-            localStorage.removeItem("tracking_data");
-            startBtn.disabled = false;
-        } catch (e) {
-            alert("終了位置が取得できません。");
-            stopBtn.disabled = false;
-        }
+        alert(`計測を終了しました。\n総距離: ${totalDistance.toFixed(3)} km`);
     };
 
     resetBtn.onclick = () => {
-        if(confirm("データをリセットしますか？")) {
-            localStorage.removeItem("tracking_data");
-            location.reload();
-        }
+        localStorage.removeItem("tracking_v2");
+        location.reload();
     };
-</script>
 
+    restoreState();
+</script>
 </body>
 </html>
